@@ -25,7 +25,11 @@ use Symfony\Component\DependencyInjection\Attribute\AutowireIterator;
 final readonly class IdentityQueryRestrictor
 {
     /**
-     * Alias used for the variant table in the shared identity subquery.
+     * Seed used to generate the variant table alias for the shared identity subquery.
+     *
+     * The actual alias is produced per-subquery via the QueryNameGenerator (e.g. "v_a1"),
+     * so multiple subqueries built in the same statement get distinct, collision-free
+     * aliases, passed to dimensions and filters.
      */
     public const VARIANT_ALIAS = 'v';
 
@@ -60,15 +64,40 @@ final readonly class IdentityQueryRestrictor
         ?QueryNameGeneratorInterface $queryNameGenerator = null,
         ?string $alias = null,
     ): void {
+        $subQb = $this->buildVariantSubQuery($queryBuilder, $identityClass, $queryNameGenerator, $alias);
+
+        // Only add the EXISTS clause if at least one dimension/filter added constraints
+        if (null !== $subQb) {
+            $queryBuilder->andWhere($queryBuilder->expr()->exists($subQb->getDQL()));
+        }
+    }
+
+    /**
+     * Builds the shared, identity-correlated variant subquery with all applicable
+     * dimensions and filters applied.
+     *
+     * @param class-string                     $identityClass      The Identity entity class (e.g., Content::class)
+     * @param QueryNameGeneratorInterface|null $queryNameGenerator Optional query name generator (creates new one if not provided)
+     * @param string|null                      $alias              Optional alias for the Identity entity (defaults to root alias)
+     */
+    public function buildVariantSubQuery(
+        QueryBuilder $queryBuilder,
+        string $identityClass,
+        ?QueryNameGeneratorInterface $queryNameGenerator = null,
+        ?string $alias = null,
+    ): ?QueryBuilder {
         $identityAttribute = $this->metadataRegistry->getIdentityMetadata($identityClass);
         if (!$identityAttribute) {
-            return;
+            return null;
         }
 
         $queryNameGenerator ??= new QueryNameGenerator();
         $context = $this->contextResolver->resolve();
         $identityAlias = $alias ?? $queryBuilder->getRootAliases()[0];
-        $variantAlias = self::VARIANT_ALIAS;
+
+        // Generate a unique variant alias per subquery so multiple subqueries built
+        // in the same statement do not collide.
+        $variantAlias = $queryNameGenerator->generateJoinAlias(self::VARIANT_ALIAS);
 
         // Resolve the identity's single ID field name so we can correlate using a
         // path expression (e.g. "o.id") instead of a bare alias ("o"). This is
@@ -105,6 +134,7 @@ final readonly class IdentityQueryRestrictor
                     $dimensionMetadata,
                     $resolvedValue,
                     $identityAlias,
+                    $variantAlias,
                 );
                 $hasConstraints = $hasConstraints || $applied;
             }
@@ -127,14 +157,12 @@ final readonly class IdentityQueryRestrictor
                     $filterMetadata,
                     $resolvedValue,
                     $identityAlias,
+                    $variantAlias,
                 );
                 $hasConstraints = $hasConstraints || $applied;
             }
         }
 
-        // Only add the EXISTS clause if at least one dimension/filter added constraints
-        if ($hasConstraints) {
-            $queryBuilder->andWhere($queryBuilder->expr()->exists($subQb->getDQL()));
-        }
+        return $hasConstraints ? $subQb : null;
     }
 }
